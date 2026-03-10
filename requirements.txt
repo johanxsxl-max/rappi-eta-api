@@ -1,3 +1,4 @@
 flask
 snowflake-connector-python
 gunicorn
+flask-limiter
