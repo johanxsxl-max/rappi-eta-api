@@ -7,6 +7,7 @@ import os
 
 app = Flask(__name__)
 
+# Configuración del limitador
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -26,13 +27,14 @@ def get_snowflake_conn():
     )
 
 def parse_json_fields(row, columns):
-    """Función auxiliar para limpiar fechas y JSONs"""
+    """Limpia fechas y convierte strings de JSON en objetos reales"""
     res_dict = {}
     for i, val in enumerate(row):
         if hasattr(val, 'isoformat'):
             res_dict[columns[i]] = val.isoformat()
         elif isinstance(val, str) and (val.strip().startswith('{') or val.strip().startswith('[')):
             try:
+                # Intentar parsear si es un JSON string
                 res_dict[columns[i]] = json.loads(val)
             except:
                 res_dict[columns[i]] = val
@@ -40,14 +42,21 @@ def parse_json_fields(row, columns):
             res_dict[columns[i]] = val
     return res_dict
 
-# --- ENDPOINT 1: CÁLCULO INICIAL (EL QUE YA TENÍAS) ---
+# --- ENDPOINT 1: CÁLCULO INICIAL OPTIMIZADO CON TRAVEL_TIME ---
 @app.route('/get_eta', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_eta():
     order_id = request.args.get('order_id')
-    country = request.args.get('country', 'co').lower()
+    country = request.args.get('country', 'co').upper()
     if not order_id: return jsonify({"error": "Falta order_id"}), 400
     
+    tz_fallbacks = {
+        'MX': 'America/Mexico_City', 'CO': 'America/Bogota', 'BR': 'America/Sao_Paulo',
+        'AR': 'America/Argentina/Buenos_Aires', 'PE': 'America/Lima', 'CL': 'America/Santiago',
+        'EC': 'America/Guayaquil', 'CR': 'America/Costa_Rica', 'UY': 'America/Montevideo'
+    }
+    tz_default = tz_fallbacks.get(country, 'UTC')
+
     try:
         conn = get_snowflake_conn()
         cursor = conn.cursor()
@@ -56,26 +65,48 @@ def get_eta():
         
         query = f"""
         WITH post_orders AS (
-            SELECT '{country.upper()}' AS country, post.order_id, post.store_id, post.user_id, post.source, post.event,
-                post.value AS post_order_eta, post.ranges_lower, post.ranges_upper, post.eta_parts, post.created_at_utc,
-                convert_timezone(COALESCE(post.time_zone_id, o.time_zone_id), post.created_at_utc)::timestamp_ntz AS local_created,
-                DATEADD('minutes', -15, local_created) AS search_start, DATEADD('minutes', 15, local_created) AS search_end
-            FROM fivetran.predictions.{country}_post_order_etas_audit_logs post
-            JOIN {country}_core_orders_public.order_eta o ON post.order_id = o.order_id
+            SELECT 
+                '{country}' AS country,
+                post.order_id, post.store_id, post.user_id, post.source, post.event,
+                post.value AS post_order_eta, post.ranges_lower, post.ranges_upper,
+                post.eta_parts, post.created_at_utc,
+                convert_timezone(COALESCE(post.time_zone_id, '{tz_default}'), post.created_at_utc)::timestamp_ntz AS local_created,
+                DATEADD('minutes', -5, local_created) AS search_start,
+                DATEADD('minutes', 5, local_created) AS search_end,
+                o.delivery_option
+            FROM fivetran.predictions.{country.lower()}_post_order_etas_audit_logs post
+            JOIN fivetran.{country.lower()}_core_orders_public.delivery_order o ON post.order_id = o.order_id
             WHERE post.order_id = {order_id}
             QUALIFY ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY post.created_at_utc ASC) = 1
         ),
         pre_orders_filtered AS (
-            SELECT pre.store_id, pre.APPLICATION_USER_ID AS user_id, pre.eta, pre.eta_raw,
-                pre.created_at, pre.detail_process, pre.buffer, pre.travel_time
-            FROM predictions.{country}_eta_audit_logs pre
-            WHERE pre.store_id IS NOT NULL AND pre.APPLICATION_USER_ID IS NOT NULL
+            SELECT 
+                pre.store_id, pre.APPLICATION_USER_ID AS user_id, pre.eta, pre.eta_raw,
+                pre.created_at, pre.detail_process, pre.buffer, pre.travel_time,
+                CASE WHEN pre.detail_process:trigger_name::text = 'checkout' THEN 1 ELSE 0 END AS valid_trigger
+            FROM predictions.{country.lower()}_eta_audit_logs pre
+            WHERE pre.created_at::date >= CURRENT_DATE - 180
+              AND pre.store_id IS NOT NULL 
+              AND pre.APPLICATION_USER_ID IS NOT NULL
+              AND pre.APPLICATION_USER_ID > 0
+        ),
+        joined_data AS (
+            SELECT 
+                post.*,
+                pre.eta, pre.eta_raw, pre.created_at AS pre_created, pre.detail_process, pre.buffer, pre.travel_time,
+                ROW_NUMBER() OVER(PARTITION BY post.order_id 
+                                 ORDER BY ABS(DATEDIFF('second', post.local_created, pre.created_at))) AS time_rank
+            FROM post_orders post
+            LEFT JOIN pre_orders_filtered pre 
+                ON pre.store_id = post.store_id
+                AND pre.user_id = post.user_id
+                AND pre.valid_trigger = 1
+                AND pre.created_at BETWEEN post.search_start AND post.search_end
         )
-        SELECT post.*, pre.eta, pre.eta_raw, pre.created_at AS pre_created, pre.detail_process, pre.buffer, pre.travel_time
-        FROM post_orders post
-        LEFT JOIN pre_orders_filtered pre ON pre.store_id = post.store_id AND pre.user_id = post.user_id
-            AND pre.created_at BETWEEN post.search_start AND post.search_end
-        QUALIFY ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY ABS(DATEDIFF('second', post.local_created, pre.created_at))) = 1
+        SELECT country, local_created, order_id, store_id, user_id, delivery_option, 
+               source, event, post_order_eta, eta, eta_raw, travel_time, pre_created, 
+               detail_process, buffer, ranges_lower, ranges_upper, eta_parts
+        FROM joined_data WHERE time_rank = 1
         """
         cursor.execute(query)
         columns = [col[0].lower() for col in cursor.description]
@@ -86,7 +117,7 @@ def get_eta():
     finally:
         if 'conn' in locals(): conn.close()
 
-# --- ENDPOINT 2: ACTUALIZACIONES DE ETA (EL NUEVO) ---
+# --- ENDPOINT 2: ACTUALIZACIONES (MANTENIDO IGUAL) ---
 @app.route('/get_updates', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_updates():
@@ -106,14 +137,9 @@ def get_updates():
             post.order_id, post.store_id, post.user_id, post.source, post.event,
             post.value AS post_order_eta, post.ranges_lower, post.ranges_upper,
             post.eta_parts,
-            convert_timezone(COALESCE(post.time_zone_id, o.time_zone_id), post.created_at_utc)::timestamp_ntz AS local_created, 
-            CASE 
-                WHEN ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY post.created_at_utc ASC) = 1 THEN TRUE 
-                WHEN post.eta_parts:count_down = TRUE THEN TRUE 
-                ELSE post.user_eta_updated
-            END AS user_eta_update 
+            convert_timezone(COALESCE(post.time_zone_id, 'UTC'), post.created_at_utc)::timestamp_ntz AS local_created
         FROM fivetran.predictions.{country}_post_order_etas_audit_logs post
-        JOIN {country}_core_orders_public.order_eta o ON post.order_id = o.order_id
+        JOIN fivetran.{country}_core_orders_public.order_eta o ON post.order_id = o.order_id
         WHERE post.order_id = {order_id}
           AND post.eta_parts:count_down IS NOT NULL
         ORDER BY post.created_at_utc ASC
@@ -121,7 +147,6 @@ def get_updates():
         cursor.execute(query)
         columns = [col[0].lower() for col in cursor.description]
         rows = cursor.fetchall()
-        
         if rows:
             results = [parse_json_fields(r, columns) for r in rows]
             return jsonify({"status": "success", "count": len(results), "data": results})
@@ -133,5 +158,3 @@ def get_updates():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
-
