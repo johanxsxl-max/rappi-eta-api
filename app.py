@@ -67,11 +67,11 @@ def get_eta():
         ),
         pre_orders_filtered AS (
             SELECT pre.store_id, pre.APPLICATION_USER_ID AS user_id, pre.eta, pre.eta_raw,
-                pre.created_at, pre.detail_process, pre.buffer
+                pre.created_at, pre.detail_process, pre.buffer, pre.travel_time
             FROM predictions.{country}_eta_audit_logs pre
             WHERE pre.store_id IS NOT NULL AND pre.APPLICATION_USER_ID IS NOT NULL
         )
-        SELECT post.*, pre.eta, pre.eta_raw, pre.created_at AS pre_created, pre.detail_process, pre.buffer
+        SELECT post.*, pre.eta, pre.eta_raw, pre.created_at AS pre_created, pre.detail_process, pre.buffer, pre.travel_time
         FROM post_orders post
         LEFT JOIN pre_orders_filtered pre ON pre.store_id = post.store_id AND pre.user_id = post.user_id
             AND pre.created_at BETWEEN post.search_start AND post.search_end
@@ -133,4 +133,5 @@ def get_updates():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
 
