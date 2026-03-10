@@ -5,7 +5,6 @@ import os
 
 app = Flask(__name__)
 
-# Configuración usando Variables de Entorno (por seguridad)
 def get_snowflake_conn():
     return snowflake.connector.connect(
         user="johan.sanchez@rappi.com",
@@ -30,7 +29,6 @@ def get_eta():
         cursor.execute("USE WAREHOUSE OPERATIONS")
         cursor.execute("USE ROLE OPERATIONS_ROLE")
         
-        # Tu query ganadora
         mi_query = f"""
         WITH post_orders AS (
             SELECT 
@@ -49,7 +47,7 @@ def get_eta():
         pre_orders_filtered AS (
             SELECT 
                 pre.store_id, pre.APPLICATION_USER_ID AS user_id, pre.eta, pre.eta_raw,
-                pre.created_at, PARSE_JSON(pre.detail_process) as detail_process, pre.buffer
+                pre.created_at, pre.detail_process, pre.buffer
             FROM predictions.{country}_eta_audit_logs pre
             WHERE pre.store_id IS NOT NULL AND pre.APPLICATION_USER_ID IS NOT NULL
         ),
@@ -72,7 +70,20 @@ def get_eta():
         row = cursor.fetchone()
         
         if row:
-            res_dict = {columns[i]: (val.isoformat() if hasattr(val, 'isoformat') else val) for i, val in enumerate(row)}
+            res_dict = {}
+            for i, val in enumerate(row):
+                # 1. Manejo de fechas
+                if hasattr(val, 'isoformat'):
+                    res_dict[columns[i]] = val.isoformat()
+                # 2. LIMPIEZA DE JSONS (Aquí está el truco)
+                elif isinstance(val, str) and val.strip().startswith('{'):
+                    try:
+                        res_dict[columns[i]] = json.loads(val)
+                    except:
+                        res_dict[columns[i]] = val
+                else:
+                    res_dict[columns[i]] = val
+            
             return jsonify({"status": "success", "data": res_dict})
         return jsonify({"status": "not_found"}), 404
     except Exception as e:
