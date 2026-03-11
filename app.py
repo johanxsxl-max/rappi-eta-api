@@ -142,7 +142,8 @@ def get_updates():
                 WHEN ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY post.created_at_utc ASC) = 1 THEN TRUE 
                 WHEN post.eta_parts:count_down = TRUE THEN TRUE 
                 ELSE post.user_eta_updated
-            END AS user_eta_update 
+            END AS user_eta_update, 
+            eta_publish
         FROM fivetran.predictions.{country}_post_order_etas_audit_logs post
         JOIN fivetran.{country}_core_orders_public.order_eta o ON post.order_id = o.order_id
         WHERE post.order_id = {order_id}
@@ -163,4 +164,5 @@ def get_updates():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
 
