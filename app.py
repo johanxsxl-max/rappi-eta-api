@@ -84,6 +84,7 @@ def get_eta():
             JOIN fivetran.{country.lower()}_core_orders_public.delivery_order o 
                 ON post.order_id = o.order_id
             WHERE post.order_id = {order_id}
+              AND eta_parts:count_down IS NOT NULL 
             QUALIFY ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY post.created_at_utc ASC) = 1
         ),
         pre_orders_filtered AS (
@@ -183,3 +184,4 @@ def get_updates():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
