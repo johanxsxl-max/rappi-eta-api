@@ -7,7 +7,7 @@ import os
 
 app = Flask(__name__)
 
-# Configuración del limitador
+# Configuración del limitador (10 llamadas por minuto por IP)
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -41,7 +41,7 @@ def parse_json_fields(row, columns):
             res_dict[columns[i]] = val
     return res_dict
 
-# --- ENDPOINT 1: CÁLCULO INICIAL (OPTIMIZADO) ---
+# --- ENDPOINT 1: CÁLCULO INICIAL (CON TURBO OPTIMIZADO) ---
 @app.route('/get_eta', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_eta():
@@ -66,64 +66,33 @@ def get_eta():
         WITH post_orders AS (
             SELECT 
                 '{country}' AS country,
-                post.order_id, 
-                post.store_id, 
-                post.user_id, 
-                post.source, 
-                post.event,
-                post.value AS post_order_eta, 
-                post.ranges_lower, 
-                post.ranges_upper,
-                post.eta_parts, 
-                post.created_at_utc,
+                post.order_id, post.store_id, post.user_id, post.source, post.event,
+                post.value AS post_order_eta, post.ranges_lower, post.ranges_upper,
+                post.eta_parts, post.created_at_utc,
                 convert_timezone(COALESCE(post.time_zone_id, '{tz_default}'), post.created_at_utc)::timestamp_ntz AS local_created,
                 DATEADD('minutes', -5, local_created) AS search_start,
                 DATEADD('minutes', 5, local_created) AS search_end,
                 o.delivery_option
             FROM fivetran.predictions.{country.lower()}_post_order_etas_audit_logs post
-            JOIN fivetran.{country.lower()}_core_orders_public.delivery_order o 
-                ON post.order_id = o.order_id
+            JOIN fivetran.{country.lower()}_core_orders_public.delivery_order o ON post.order_id = o.order_id
             WHERE post.order_id = {order_id}
-              AND eta_parts:count_down IS NOT NULL 
             QUALIFY ROW_NUMBER() OVER(PARTITION BY post.order_id ORDER BY post.created_at_utc ASC) = 1
         ),
         pre_orders_filtered AS (
             SELECT 
-                pre.store_id, 
-                pre.APPLICATION_USER_ID AS user_id, 
-                pre.eta, 
-                pre.eta_raw,
-                pre.created_at, 
-                pre.detail_process, 
-                pre.buffer, 
-                pre.travel_time
+                pre.store_id, pre.APPLICATION_USER_ID AS user_id, pre.eta, pre.eta_raw,
+                pre.created_at, pre.detail_process, pre.buffer, pre.travel_time
             FROM predictions.{country.lower()}_eta_audit_logs pre
-            INNER JOIN post_orders p 
-                ON pre.store_id = p.store_id 
-                AND pre.APPLICATION_USER_ID = p.user_id
+            INNER JOIN post_orders p ON pre.store_id = p.store_id AND pre.APPLICATION_USER_ID = p.user_id
             WHERE pre.created_at BETWEEN p.search_start AND p.search_end
               AND pre.detail_process:trigger_name::text = 'checkout'
               AND pre.APPLICATION_USER_ID > 0
         )
         SELECT 
-            p.country, 
-            p.local_created, 
-            p.order_id, 
-            p.store_id, 
-            p.user_id, 
-            p.delivery_option, 
-            p.source, 
-            p.event, 
-            p.post_order_eta, 
-            pre.eta, 
-            pre.eta_raw, 
-            pre.travel_time, 
-            pre.created_at AS pre_created, 
-            pre.detail_process, 
-            pre.buffer, 
-            p.ranges_lower, 
-            p.ranges_upper, 
-            p.eta_parts
+            p.country, p.local_created, p.order_id, p.store_id, p.user_id, p.delivery_option, 
+            p.source, p.event, p.post_order_eta, pre.eta, pre.eta_raw, pre.travel_time, 
+            pre.created_at AS pre_created, pre.detail_process, pre.buffer, 
+            p.ranges_lower, p.ranges_upper, p.eta_parts
         FROM post_orders p
         LEFT JOIN pre_orders_filtered pre ON 1=1
         QUALIFY ROW_NUMBER() OVER(PARTITION BY p.order_id ORDER BY ABS(DATEDIFF('second', p.local_created, pre.created_at))) = 1
@@ -137,7 +106,7 @@ def get_eta():
     finally:
         if 'conn' in locals(): conn.close()
 
-# --- ENDPOINT 2: ACTUALIZACIONES (HISTORIAL) ---
+# --- ENDPOINT 2: ACTUALIZACIONES DE ETA (HISTORIAL) ---
 @app.route('/get_updates', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_updates():
@@ -181,7 +150,39 @@ def get_updates():
     finally:
         if 'conn' in locals(): conn.close()
 
+# --- ENDPOINT 3: ASSIGN MONITORING (NUEVO) ---
+@app.route('/get_assignments', methods=['GET'])
+@limiter.limit("10 per minute")
+def get_assignments():
+    order_id = request.args.get('order_id')
+    country = request.args.get('country', 'co').upper()
+    if not order_id: return jsonify({"error": "Falta order_id"}), 400
+
+    try:
+        conn = get_snowflake_conn()
+        cursor = conn.cursor()
+        cursor.execute("USE WAREHOUSE OPERATIONS")
+        
+        query = f"""
+        SELECT 
+            iteration_id AS id, '{country}' AS country, order_id, 
+            data AS data_json, created_at 
+        FROM FIVETRAN.{country}_PG_MS_ASSIGN_MONITORING_PUBLIC.ORDERS 
+        WHERE order_id = {order_id}
+          AND iteration_id IS NOT NULL 
+        ORDER BY created_at DESC
+        """
+        cursor.execute(query)
+        columns = [col[0].lower() for col in cursor.description]
+        rows = cursor.fetchall()
+        if rows:
+            results = [parse_json_fields(r, columns) for r in rows]
+            return jsonify({"status": "success", "count": len(results), "data": results})
+        return jsonify({"status": "not_found"}), 404
+    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        if 'conn' in locals(): conn.close()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
-
