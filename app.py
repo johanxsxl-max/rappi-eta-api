@@ -7,7 +7,7 @@ import os
 
 app = Flask(__name__)
 
-# Configuración del limitador (10 llamadas por minuto por IP)
+# Configuración del limitador
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -41,7 +41,7 @@ def parse_json_fields(row, columns):
             res_dict[columns[i]] = val
     return res_dict
 
-# --- ENDPOINT 1: CÁLCULO INICIAL (CON TURBO OPTIMIZADO) ---
+# --- ENDPOINT 1: CÁLCULO INICIAL (OPTIMIZADO) ---
 @app.route('/get_eta', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_eta():
@@ -150,7 +150,7 @@ def get_updates():
     finally:
         if 'conn' in locals(): conn.close()
 
-# --- ENDPOINT 3: ASSIGN MONITORING (NUEVO) ---
+# --- ENDPOINT 3: ASSIGN MONITORING (JOIN CON RP_GOLD_DB_PROD) ---
 @app.route('/get_assignments', methods=['GET'])
 @limiter.limit("10 per minute")
 def get_assignments():
@@ -162,15 +162,28 @@ def get_assignments():
         conn = get_snowflake_conn()
         cursor = conn.cursor()
         cursor.execute("USE WAREHOUSE OPERATIONS")
+        cursor.execute("USE ROLE OPERATIONS_ROLE")
         
         query = f"""
-        SELECT 
-            iteration_id AS id, '{country}' AS country, order_id, 
-            data AS data_json, created_at 
-        FROM FIVETRAN.{country}_PG_MS_ASSIGN_MONITORING_PUBLIC.ORDERS 
-        WHERE order_id = {order_id}
-          AND iteration_id IS NOT NULL 
-        ORDER BY created_at DESC
+        WITH orders AS (
+            SELECT iteration_id AS id, '{country}' country, order_id, iteration_id, data AS data_json, created_at
+            FROM FIVETRAN.{country}_PG_MS_ASSIGN_MONITORING_PUBLIC.ORDERS 
+            WHERE order_id = {order_id}
+              AND iteration_id IS NOT NULL 
+              AND order_id IS NOT NULL
+        ),
+        iterations AS (
+            SELECT country, iteration_source, order_id, iteration_id, iterating_couriers,
+                   prospects, is_match, is_booking, taken, courier_id, courier_geoqueue_id,
+                   is_trusted_courier, is_queued_courier, courier_level, notification_distance,
+                   notification_earnings, bundle_size, orders
+            FROM RP_GOLD_DB_PROD.FUL_CORE_DS.ASSIGN_ITERATIONS
+            WHERE order_id = {order_id} AND country = '{country}'
+        )
+        SELECT a.*, b.* EXCLUDE(country, order_id, iteration_id)
+        FROM orders a
+        LEFT JOIN iterations b USING(country, order_id, iteration_id)
+        ORDER BY a.created_at DESC
         """
         cursor.execute(query)
         columns = [col[0].lower() for col in cursor.description]
